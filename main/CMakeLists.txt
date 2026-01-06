@@ -10,5 +10,6 @@ idf_component_register(
         "app_camera_esp.c"
         "esp_cli.c"
         "custom_images.c"
+        "led_strip_encoder.c"
     INCLUDE_DIRS "."
 )

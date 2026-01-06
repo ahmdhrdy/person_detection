@@ -1,56 +1,38 @@
-/* Copyright 2019 The TensorFlow Authors. All Rights Reserved. */
-
-#include "string.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-
-#if (CONFIG_TFLITE_USE_BSP)
-#include "bsp/esp-bsp.h"
-#endif
-
-#include "esp_heap_caps.h"
-#include "esp_log.h"
-
+#include "image_provider.h"
 #include "app_camera_esp.h"
 #include "esp_camera.h"
-#include "model_settings.h"
-#include "image_provider.h"
-#include "esp_main.h"
-
-// Forward declaration for C linkage
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-const char* get_current_roi_name();
-
-#ifdef __cplusplus
-}
-#endif
+#include "esp_log.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <cstdlib>
+#include <cstring>
 
 static const char* TAG = "image_provider";
-static uint16_t* display_buf;
 
-// ROI STRATEGY: 4 overlapping regions from 320×240 frame
+// ROI definitions - CENTER-FOCUSED for far detection
 typedef struct {
-  int x, y, w, h;
+  int x;
+  int y;
+  int w;
+  int h;
   const char* name;
 } ROI;
 
-// Define 4 ROIs covering the frame strategically
 static const ROI rois[] = {
-  {0, 0, 160, 160, "Top-Left"},       // Covers top-left area
-  {160, 0, 160, 160, "Top-Right"},    // Covers top-right area
-  {0, 80, 160, 160, "Bottom-Left"},   // Covers bottom-left area
-  {160, 80, 160, 160, "Bottom-Right"} // Covers bottom-right area
+  {80, 0, 160, 160, "Top-Center"},
+  {0, 40, 160, 160, "Left-Center"},
+  {160, 40, 160, 160, "Right-Center"},
+  {80, 80, 160, 160, "Bottom-Center"}
 };
 static const int NUM_ROIS = sizeof(rois) / sizeof(rois[0]);
 
-// Buffers for ROI processing
-static uint8_t roi_buffer[160 * 160];  // Cropped ROI
-static uint8_t resized_96[96 * 96];    // Resized to 96×96
+static uint8_t roi_buffer[160 * 160];
+static uint8_t resized_96[96 * 96];
 
-// FUNCTION: Crop ROI from source frame
+static int current_roi_index = 0;
+
+// Crop ROI from source frame
 void crop_roi(const uint8_t* src, int src_w, int src_h,
               int x, int y, int w, int h, uint8_t* dst) {
   for (int row = 0; row < h; row++) {
@@ -61,7 +43,7 @@ void crop_roi(const uint8_t* src, int src_w, int src_h,
   }
 }
 
-// FUNCTION: Resize using nearest-neighbor (FAST on ESP32)
+// Resize using nearest-neighbor
 void resize_nearest_neighbor(const uint8_t* src, int sw, int sh,
                              uint8_t* dst, int dw, int dh) {
   for (int y = 0; y < dh; y++) {
@@ -73,57 +55,59 @@ void resize_nearest_neighbor(const uint8_t* src, int sw, int sh,
   }
 }
 
-// Get the camera module ready
-TfLiteStatus InitCamera() {
-#if CLI_ONLY_INFERENCE
-  ESP_LOGI(TAG, "CLI_ONLY_INFERENCE enabled, skipping camera init");
-  return kTfLiteOk;
-#endif
-
-#if DISPLAY_SUPPORT
-  if (display_buf == NULL) {
-    display_buf = (uint16_t *) heap_caps_malloc(96 * 2 * 96 * 2 * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  }
-  if (display_buf == NULL) {
-    ESP_LOGE(TAG, "Couldn't allocate display buffer");
-    return kTfLiteError;
-  }
-#endif
-
-#if ESP_CAMERA_SUPPORTED
-  int ret = app_camera_init();
-  if (ret != 0) {
-    MicroPrintf("Camera init failed\n");
-    return kTfLiteError;
-  }
-  MicroPrintf("Camera Initialized for ROI detection\n");
-  ESP_LOGI(TAG, "ROI Strategy: Processing %d regions per frame", NUM_ROIS);
-#else
-  ESP_LOGE(TAG, "Camera not supported for this device");
-#endif
-  return kTfLiteOk;
+// Get ROI name
+extern "C" const char* get_current_roi_name() {
+  int prev_index = (current_roi_index - 1 + NUM_ROIS) % NUM_ROIS;
+  return rois[prev_index].name;
 }
 
-void *image_provider_get_display_buf() {
-  return (void *) display_buf;
-}
-
-// GLOBAL: Store current ROI index for multi-ROI detection
-static int current_roi_index = 0;
-
-// Get an image from the camera module (ONE ROI AT A TIME)
 TfLiteStatus GetImage(int image_width, int image_height, int channels, int8_t* image_data) {
 #if ESP_CAMERA_SUPPORTED
   static camera_fb_t* fb = NULL;
   
-  // On first ROI (index 0), capture new frame
+  // On first ROI, capture new frame
   if (current_roi_index == 0) {
     if (fb != NULL) {
-      esp_camera_fb_return(fb);  // Return previous frame
+      esp_camera_fb_return(fb);
+      fb = NULL;
     }
-    fb = esp_camera_fb_get();
-    if (!fb) {
-      ESP_LOGE(TAG, "Camera capture failed");
+    
+    // ULTRA-AGGRESSIVE RETRY for QVGA
+    int retry_count = 0;
+    const int MAX_RETRIES = 15;  // More retries
+    
+    while (retry_count < MAX_RETRIES) {
+      // CRITICAL: Wait BEFORE capture
+      vTaskDelay(pdMS_TO_TICKS(150));  // 150ms delay BEFORE each attempt!
+      
+      fb = esp_camera_fb_get();
+      
+      if (!fb) {
+        ESP_LOGW(TAG, "Capture failed, retry %d/%d", retry_count + 1, MAX_RETRIES);
+        retry_count++;
+        continue;
+      }
+      
+      // Validate frame size
+      const size_t expected_size = 320 * 240;
+      if (fb->len == expected_size) {
+        // SUCCESS!
+        break;
+      }
+      
+      // Invalid size
+      ESP_LOGW(TAG, "Invalid size: %zu (expected %zu), retry %d/%d", 
+               fb->len, expected_size, retry_count + 1, MAX_RETRIES);
+      esp_camera_fb_return(fb);
+      fb = NULL;
+      retry_count++;
+      
+      // CRITICAL: Long wait after bad frame
+      vTaskDelay(pdMS_TO_TICKS(300));  // 300ms wait!
+    }
+    
+    if (fb == NULL || fb->len != 320 * 240) {
+      ESP_LOGE(TAG, "Failed to get valid frame after %d retries", MAX_RETRIES);
       return kTfLiteError;
     }
   }
@@ -131,37 +115,51 @@ TfLiteStatus GetImage(int image_width, int image_height, int channels, int8_t* i
   // Process current ROI
   const ROI* roi = &rois[current_roi_index];
   
-  // Step 1: Crop ROI from 320×240 frame
+  // Crop 160×160 ROI
   crop_roi((uint8_t*)fb->buf, 320, 240,
            roi->x, roi->y, roi->w, roi->h,
            roi_buffer);
   
-  // Step 2: Resize 160×160 ROI → 96×96
+  // Resize to 96×96
   resize_nearest_neighbor(roi_buffer, 160, 160,
                           resized_96, 96, 96);
   
-  // Step 3: Quantize to INT8 for model
+  // Quantize to INT8
   for (int i = 0; i < 96 * 96; i++) {
-    image_data[i] = resized_96[i] ^ 0x80;  // Convert to signed INT8
+    image_data[i] = (int8_t)(resized_96[i] - 128);
   }
   
-  // Move to next ROI (wrap around)
+  // Move to next ROI
   current_roi_index = (current_roi_index + 1) % NUM_ROIS;
   
-  // If we completed all ROIs, return the frame
+  // If completed all ROIs, return frame
   if (current_roi_index == 0 && fb != NULL) {
     esp_camera_fb_return(fb);
     fb = NULL;
+    
+    // CRITICAL: Wait after returning frame
+    vTaskDelay(pdMS_TO_TICKS(100));  // 100ms wait
   }
   
   return kTfLiteOk;
+  
 #else
   return kTfLiteError;
 #endif
 }
 
-// HELPER: Get current ROI name for logging (extern C for linking)
-extern "C" const char* get_current_roi_name() {
-  int prev_index = (current_roi_index - 1 + NUM_ROIS) % NUM_ROIS;
-  return rois[prev_index].name;
+// Initialize camera
+TfLiteStatus InitCamera() {
+#if ESP_CAMERA_SUPPORTED
+  ESP_LOGI(TAG, "Camera Initialized for ROI detection\n");
+  ESP_LOGI(TAG, "ROI Strategy: Processing %d regions per frame", NUM_ROIS);
+  
+  int ret = app_camera_init();
+  if (ret != 0) {
+    return kTfLiteError;
+  }
+  return kTfLiteOk;
+#else
+  return kTfLiteError;
+#endif
 }
